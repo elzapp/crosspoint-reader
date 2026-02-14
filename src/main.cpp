@@ -148,10 +148,23 @@ void enterNewActivity(Activity* activity) {
 
 // Verify power button press duration on wake-up from deep sleep
 // Pre-condition: isWakeupByPowerButton() == true
+// Requires both power button AND back button to be pressed simultaneously to wake up.
+// This prevents accidental power-on when the device is in a pocket.
 void verifyPowerButtonDuration() {
   if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP) {
-    // Fast path for short press
-    // Needed because inputManager.isPressed() may take up to ~500ms to return the correct state
+    // Fast path for short press - still require back button
+    gpio.update();
+    // Wait briefly for button states to stabilize
+    const auto start = millis();
+    while (millis() - start < 500) {
+      gpio.update();
+      if (gpio.isPressed(HalGPIO::BTN_POWER) && gpio.isPressed(HalGPIO::BTN_BACK)) {
+        return;  // Both buttons pressed, allow wake-up
+      }
+      delay(10);
+    }
+    // Back button not pressed along with power, go back to sleep
+    gpio.startDeepSleep();
     return;
   }
 
@@ -174,17 +187,23 @@ void verifyPowerButtonDuration() {
 
   t2 = millis();
   if (gpio.isPressed(HalGPIO::BTN_POWER)) {
+    // Check if back button is also pressed (required for pocket-safe wake-up)
+    bool backButtonPressed = false;
     do {
       delay(10);
       gpio.update();
+      if (gpio.isPressed(HalGPIO::BTN_BACK)) {
+        backButtonPressed = true;
+      }
     } while (gpio.isPressed(HalGPIO::BTN_POWER) && gpio.getHeldTime() < calibratedPressDuration);
-    abort = gpio.getHeldTime() < calibratedPressDuration;
+    // Abort if power released too early OR back button was never pressed
+    abort = gpio.getHeldTime() < calibratedPressDuration || !backButtonPressed;
   } else {
     abort = true;
   }
 
   if (abort) {
-    // Button released too early. Returning to sleep.
+    // Button released too early or back button not pressed. Returning to sleep.
     // IMPORTANT: Re-arm the wakeup trigger before sleeping again
     powerManager.startDeepSleep(gpio);
   }
@@ -193,6 +212,16 @@ void verifyPowerButtonDuration() {
 void waitForPowerRelease() {
   gpio.update();
   while (gpio.isPressed(HalGPIO::BTN_POWER)) {
+    delay(50);
+    gpio.update();
+  }
+}
+
+// Wait for back button to be released after wake-up verification.
+// This prevents the back button held during power-on from triggering a "go to home" action.
+void waitForBackRelease() {
+  gpio.update();
+  while (gpio.isPressed(HalGPIO::BTN_BACK)) {
     delay(50);
     gpio.update();
   }
@@ -325,6 +354,8 @@ void setup() {
       // For normal wakeups, verify power button press duration
       LOG_DBG("MAIN", "Verifying power button press duration");
       verifyPowerButtonDuration();
+      // Wait for back button release so it doesn't trigger "go to home" action
+      waitForBackRelease();
       break;
     case HalGPIO::WakeupReason::AfterUSBPower:
       // If USB power caused a cold boot, go back to sleep
